@@ -38,3 +38,10 @@ class PrioritySampler:
 
     def get_all_samples(self) -> List[Any]:
         return self.items
+
+    def pop(self):
+        self.item_priorities.pop()
+        return self.items.pop()
+
+    def size(self):
+        return len(self.items)

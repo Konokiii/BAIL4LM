@@ -1,6 +1,7 @@
 from functools import partial
 from typing import Any, Dict, List
 import numpy as np
+import torch.cuda
 
 from rl4lms.data_pools.text_generation_pool import Sample
 from rl4lms.envs.text_generation.env import TextGenEnv
@@ -8,11 +9,11 @@ from rl4lms.envs.text_generation.evaluation_utils import evaluate_on_samples
 from rl4lms.envs.text_generation.utils_supervised import evaluate_on_samples as evaluate_supervised
 from rl4lms.envs.text_generation.logging_utils import Tracker
 from rl4lms.envs.text_generation.registry import (DataPoolRegistry,
-                                                   MetricRegistry,
-                                                   RewardFunctionRegistry,
-                                                   PolicyRegistry,
-                                                   AlgorithmRegistry,
-                                                   WrapperRegistry)
+                                                  MetricRegistry,
+                                                  RewardFunctionRegistry,
+                                                  PolicyRegistry,
+                                                  AlgorithmRegistry,
+                                                  WrapperRegistry)
 from rl4lms.envs.text_generation.reward import RewardFunction
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import SubprocVecEnv
@@ -24,11 +25,13 @@ from transformers import (AutoTokenizer,
                           DataCollatorForLanguageModeling,
                           DataCollatorForSeq2Seq)
 from rl4lms.envs.text_generation.utils_supervised import (get_datasets_for_causal,
-                                                           get_datasets_for_seq2seq,
-                                                           tokenize_causal,
-                                                           tokenize_seq2seq,
-                                                           EvalCallack)
+                                                          get_datasets_for_seq2seq,
+                                                          tokenize_causal,
+                                                          tokenize_seq2seq,
+                                                          EvalCallack)
 from rl4lms.envs.text_generation.warm_start import TrainerWarmStartMixin
+
+from rl4lms.envs.text_generation.bail_alg import BAIL
 
 
 def build_tokenizer(tokenizer_config: Dict[str, Any]):
@@ -56,7 +59,6 @@ def build_metrics(metric_configs: List[Dict[str, Any]]):
 
 
 def build_datapool(datapool_config: Dict[str, Any]):
-
     def _get_datapool_by_split(split: str):
         kwargs = datapool_config.get("args", {})
         kwargs["split"] = split
@@ -73,26 +75,33 @@ def build_datapool(datapool_config: Dict[str, Any]):
         "val": [sample for sample, _ in val_datapool],
         "test": [sample for sample, _ in test_datapool]
     }
+
+    if datapool_config.get("test_train_len") is not None:
+        samples_by_split['train'] = samples_by_split['train'][:datapool_config.get("test_train_len")]
+
     return samples_by_split
 
 
 def build_env(env_config: Dict[str, Any],
               reward_fn: RewardFunction,
               tokenizer: AutoTokenizer,
-              train_samples: List[Sample]):
-    # vectoried env
+              train_samples: List[Sample],
+              build_single_env=False):
     env_kwargs = {
         "reward_function": reward_fn,
         "tokenizer": tokenizer,
         "samples": train_samples,
     }
     env_kwargs = {**env_kwargs, **env_config.get("args", {})}
-    env = make_vec_env(TextGenEnv,
+
+    if build_single_env:
+        return TextGenEnv(**env_kwargs)
+    else:
+        return make_vec_env(TextGenEnv,
                        n_envs=env_config.get(
                            "n_envs", 1),
                        vec_env_cls=SubprocVecEnv,
                        env_kwargs=env_kwargs)
-    return env
 
 
 def build_alg(alg_config: Dict[str, Any],
@@ -120,6 +129,20 @@ def build_alg(alg_config: Dict[str, Any],
                   alg_config["kl_div"].get("target_kl", None),
                   alg_config["kl_div"].get("norm_reward", False))
     alg.load_from_dict(alg_state)
+    return alg
+
+
+def build_bail_alg(alg_config: Dict[str, Any],
+                   env: TextGenEnv,
+                   tracker: Tracker):
+    policy_config = alg_config["policy"]
+    policy_cls = PolicyRegistry.get(policy_config["id"])
+
+    policy_kwargs = policy_config["args"]
+    alg_kwargs = alg_config.get("args")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    alg = BAIL(tracker, env, policy_cls, policy_kwargs, device, **alg_kwargs)
     return alg
 
 
@@ -263,15 +286,16 @@ class SupervisedTrainer:
             self._datapool_config)
         self._train_dataset = get_datasets_for_causal(
             self._samples_by_split["train"]) if self._alg_config[
-            "model_type"] == "causal" else get_datasets_for_seq2seq(self._samples_by_split["train"])
+                                                    "model_type"] == "causal" else get_datasets_for_seq2seq(
+            self._samples_by_split["train"])
         preprocess_fn = tokenize_causal if self._alg_config[
-            "model_type"] == "causal" else tokenize_seq2seq
+                                               "model_type"] == "causal" else tokenize_seq2seq
         preprocess_fn = partial(preprocess_fn, tokenizer=self._tokenizer)
         self._tokenized_dataset = self._train_dataset.map(
             preprocess_fn, batched=True,
             remove_columns=self._train_dataset.column_names)
         model_cls = AutoModelForCausalLM if self._alg_config[
-            "model_type"] == "causal" else AutoModelForSeq2SeqLM
+                                                "model_type"] == "causal" else AutoModelForSeq2SeqLM
         self._gen_kwargs = self._alg_config["generation_kwargs"]
         self._model = model_cls.from_pretrained(self._alg_config["model_name"])
         self._model.parallelize()
@@ -279,11 +303,12 @@ class SupervisedTrainer:
 
         # setting max prompt length
         self._max_prompt_length = self._tokenizer_config.get(
-            "max_length",  self._tokenizer.model_max_length)
+            "max_length", self._tokenizer.model_max_length)
 
-        if (self._alg_config["model_type"] == "causal") and ((self._max_prompt_length + self._gen_kwargs["max_new_tokens"]) > self._tokenizer.model_max_length):
+        if (self._alg_config["model_type"] == "causal") and (
+                (self._max_prompt_length + self._gen_kwargs["max_new_tokens"]) > self._tokenizer.model_max_length):
             self._max_prompt_length = self._max_prompt_length - \
-                self._gen_kwargs["max_new_tokens"]
+                                      self._gen_kwargs["max_new_tokens"]
 
         self._eval_callback = EvalCallack(self._samples_by_split["val"],
                                           self._gen_kwargs,
@@ -297,7 +322,8 @@ class SupervisedTrainer:
         train_args["seed"] = np.random.randint(1e+2)  # random seed
         self._train_args = TrainingArguments(**train_args)
         data_collator = DataCollatorForLanguageModeling(self._tokenizer, mlm=False) if self._alg_config[
-            "model_type"] == "causal" else DataCollatorForSeq2Seq(self._tokenizer, self._model)
+                                                                                           "model_type"] == "causal" else DataCollatorForSeq2Seq(
+            self._tokenizer, self._model)
         self._trainer = Trainer(model=self._model,
                                 tokenizer=self._tokenizer,
                                 args=self._train_args,
@@ -319,3 +345,132 @@ class SupervisedTrainer:
         if self._tracker is not None:
             self._tracker.save_auto_model(
                 self._model)
+
+
+class BAILTrainer:
+    """
+    A generic trainer for training LMs with BAIL algorithms
+    """
+
+    def __init__(self,
+                 tokenizer_config: Dict[str, Any],
+                 datapool_config: Dict[str, Any],
+                 reward_config: Dict[str, Any],
+                 env_config: Dict[str, Any],
+                 bail_alg_config: Dict[str, Any],
+                 train_eval_config: Dict[str, Any],
+                 tracker: Tracker = None,
+                 experiment_name: str = ''
+                 ):
+        self._tokenizer_config = tokenizer_config
+        self._datapool_config = datapool_config
+        self._reward_config = reward_config
+        self._env_config = env_config
+        self._alg_config = bail_alg_config
+        self._train_eval_config = train_eval_config
+        self._tracker = tracker
+        self._experiment_name = experiment_name
+        self._setup()
+
+    def _setup(self):
+        print('Setting up BAILTrainer:')
+        # build components
+        self._tokenizer = build_tokenizer(self._tokenizer_config)
+        print('-- Tokenizer Built')
+        self._reward_fn = build_reward_fn(self._reward_config)
+        print('-- Reward Function Built')
+        self._metrics = build_metrics(
+            self._train_eval_config.get("metrics", []))
+        print('-- Metrics Built')
+        self._samples_by_split = build_datapool(
+            self._datapool_config)
+        print('-- Datapool Built')
+        self._env = build_env(self._env_config, self._reward_fn,
+                              self._tokenizer, self._samples_by_split["train"], build_single_env=True)
+        print('-- Env Built')
+        self._alg = build_bail_alg(self._alg_config, self._env, self._tracker)
+        print('-- Algo Built')
+
+        # extract train params
+        self._max_episode_length = self._env_config["args"]["max_episode_length"]
+        self._max_prompt_length = self._env_config["args"]["max_prompt_length"]
+
+        self._bail_learn_kwargs = self._train_eval_config["bail_learn"]
+
+        self._lr = self._train_eval_config["learning_rate"]
+        self._wd = self._train_eval_config["weight_decay"]
+
+        self._eval_batch_size = self._train_eval_config["eval_batch_size"]
+        self._n_epochs = int(self._train_eval_config["n_epochs"])
+        self._train_batch_size = self._train_eval_config["train_batch_size"]
+        self._n_batch = self._train_eval_config["n_batch"]
+        self._beta = self._train_eval_config["beta"]
+        self._n_steps_per_epoch = self._train_batch_size * self._n_batch
+        self._total_timesteps = 0
+
+        # gen kwargs for evaluation (if it is different from rollout gen kwargs)
+        self._eval_gen_kwargs = self._train_eval_config.get(
+            "generation_kwargs", None)
+
+    def _evaluate_on_datapools(self, epoch: int,
+                               splits: List[str] = ["val", "test"]):
+        with torch.no_grad():
+            for split in splits:
+                evaluate_on_samples(policy=self._alg.policy,
+                                    tokenizer=self._tokenizer,
+                                    samples=self._samples_by_split[split],
+                                    batch_size=self._eval_batch_size,
+                                    max_prompt_length=self._max_prompt_length,
+                                    metrics=self._metrics,
+                                    epoch=epoch,
+                                    split_name=split,
+                                    tracker=self._tracker,
+                                    gen_kwargs=self._eval_gen_kwargs)
+
+    def train_and_eval(self):
+        self._alg.learn(**self._bail_learn_kwargs)
+
+        print('')
+        print('Setting BC training optimizer:')
+        params = list(self._alg.policy._policy_model.named_parameters())
+
+        no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
+        optimizer_grouped_parameters = [
+            {
+                "params": [p for n, p in params if not any(nd in n for nd in no_decay)],
+                "weight_decay": self._wd,
+            },
+            {
+                "params": [p for n, p in params if any(nd in n for nd in no_decay)],
+                "weight_decay": 0.0,
+            },
+        ]
+        optimizer = torch.optim.AdamW(
+            optimizer_grouped_parameters, lr=self._lr
+        )
+        print('BC training optimizer set: Done.')
+
+        # evaluate on val and test set before fine-tuning once
+        self._evaluate_on_datapools(epoch=0, splits=["test"])
+
+        for e in range(self._n_epochs):
+            epoch_loss = self._alg.BC(optimizer, self._n_batch, self._train_batch_size, epoch=e, beta=self._beta)
+            self._total_timesteps += self._n_steps_per_epoch
+
+            print(f'Epoch:{e}; Epoch_Loss:{epoch_loss}; Total_timesteps:{self._total_timesteps}')
+
+            if (e + 1) % self._train_eval_config.get("save_every", 20) == 0:
+                torch.save(self._alg.policy._policy_model.state_dict(),
+                           f'./pytorch_models/Policy_Epoch{e + 1}.pth')
+
+            # evaluate on val set in the given intervals
+            if (e + 1) % self._train_eval_config["eval_every"] == 0:
+                self._evaluate_on_datapools(epoch=e, splits=["test"])
+
+            # finally evaluate on val and test samples
+        self._evaluate_on_datapools(epoch=e, splits=["test"])
+
+        # save model here - we save only the language model
+        if self._tracker is not None:
+            self._tracker.save_auto_model(
+                self._alg.policy.get_language_model())

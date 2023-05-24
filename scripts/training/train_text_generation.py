@@ -7,6 +7,7 @@ from rl4lms.envs.text_generation.logging_utils import Tracker
 from rl4lms.envs.text_generation.training_utils import (
     OnPolicyTrainer,
     SupervisedTrainer,
+    BAILTrainer,
 )
 
 
@@ -42,6 +43,16 @@ def main(
             train_eval_config=config["train_evaluation"],
             tracker=tracker,
         )
+    elif "bail" in config["alg"]["id"]:
+        trainer = BAILTrainer(
+            tokenizer_config=config["tokenizer"],
+            datapool_config=config["datapool"],
+            reward_config=config["reward_fn"],
+            env_config=config["env"],
+            bail_alg_config=config["alg"],
+            train_eval_config=config["train_evaluation"],
+            tracker=tracker
+        )
     else:
         trainer = OnPolicyTrainer(
             tokenizer_config=config["tokenizer"],
@@ -57,7 +68,8 @@ def main(
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Fine-tune LM to generate controlled text")
-    parser.add_argument("--config_path", type=str, help="path to the config file")
+    parser.add_argument("--config_path", type=str, help="path to the config file",
+                        default="./task_configs/imdb_text_continuation/gpt2_bail.yml")
     parser.add_argument(
         "--project_name", type=str, help="WANDB project name", default="rl4lm_exps"
     )

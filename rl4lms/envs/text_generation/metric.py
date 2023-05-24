@@ -669,8 +669,7 @@ class IntentAccuracyDailyDialog(BaseMetric):
         self._model = AutoModelForSequenceClassification.from_pretrained(
             "rajkumarrrk/roberta-daily-dialog-intent-classifier"
         )
-        self._device = "cuda" if torch.cuda.is_available() else "cpu"
-        self._device = f"cuda:{torch.cuda.device_count() - 1}"
+        self._device = f"cuda:{torch.cuda.device_count() - 1}" if torch.cuda.is_available() else "cpu"
         self._model = self._model.to(self._device)
 
     def compute(

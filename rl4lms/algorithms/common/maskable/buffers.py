@@ -211,16 +211,53 @@ class MaskableDictRolloutBuffer(DictRolloutBuffer):
             yield self._get_samples(indices[start_idx: start_idx + batch_size])
             start_idx += batch_size
 
+    def get_from_idxs(self, batch_size, indices):
+        # Prepare the data
+        if not self.generator_ready:
+
+            for key, obs in self.observations.items():
+                self.observations[key] = self.swap_and_flatten(obs)
+
+            _tensor_names = ["actions", "values", "log_probs",
+                             "advantages", "returns", "action_masks"]
+
+            for tensor in _tensor_names:
+                self.__dict__[tensor] = self.swap_and_flatten(
+                    self.__dict__[tensor])
+            self.generator_ready = True
+
+        # Return everything, don't create minibatches
+        if batch_size is None:
+            batch_size = self.buffer_size * self.n_envs
+
+        start_idx = 0
+        while start_idx < len(indices):
+            yield self._get_samples(indices[start_idx: start_idx + batch_size])
+            start_idx += batch_size
+
+    # def _get_samples(self, batch_inds: np.ndarray, env: Optional[VecNormalize] = None) -> MaskableDictRolloutBufferSamples:
+    #
+    #     return MaskableDictRolloutBufferSamples(
+    #         observations={key: self.to_torch(obs[batch_inds]) for (
+    #             key, obs) in self.observations.items()},
+    #         actions=self.to_torch(self.actions[batch_inds]),
+    #         old_values=self.to_torch(self.values[batch_inds].flatten()),
+    #         old_log_prob=self.to_torch(self.log_probs[batch_inds].flatten()),
+    #         advantages=self.to_torch(self.advantages[batch_inds].flatten()),
+    #         returns=self.to_torch(self.returns[batch_inds].flatten()),
+    #         action_masks=self.to_torch(
+    #             self.action_masks[batch_inds].reshape(-1, self.mask_dims)),
+    #     )
+
     def _get_samples(self, batch_inds: np.ndarray, env: Optional[VecNormalize] = None) -> MaskableDictRolloutBufferSamples:
 
         return MaskableDictRolloutBufferSamples(
-            observations={key: self.to_torch(obs[batch_inds]) for (
+            observations={key: self.to_torch(obs[batch_inds], copy=False) for (
                 key, obs) in self.observations.items()},
-            actions=self.to_torch(self.actions[batch_inds]),
-            old_values=self.to_torch(self.values[batch_inds].flatten()),
-            old_log_prob=self.to_torch(self.log_probs[batch_inds].flatten()),
-            advantages=self.to_torch(self.advantages[batch_inds].flatten()),
-            returns=self.to_torch(self.returns[batch_inds].flatten()),
-            action_masks=self.to_torch(
-                self.action_masks[batch_inds].reshape(-1, self.mask_dims)),
+            actions=self.to_torch(self.actions[batch_inds], copy=False),
+            old_values=None,
+            old_log_prob=None,
+            advantages=None,
+            returns=self.to_torch(self.returns[batch_inds].flatten(), copy=False),
+            action_masks=None,
         )

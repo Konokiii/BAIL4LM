@@ -1,0 +1,82 @@
+tokenizer:
+  model_name: lvwerra/gpt2-imdb
+  padding_side: left
+  truncation_side: left
+  pad_token_as_eos_token: True
+
+reward_fn:
+  id: learned_reward
+  args: 
+    model_name: lvwerra/distilbert-imdb
+    label_ix: 1
+    include_prompt_for_eval: True
+
+datapool:
+  id: imdb
+  args:
+    seed: 42
+
+env:
+  args:
+    max_prompt_length: 64
+    max_episode_length: 48
+    terminate_on_eos: True
+
+alg:
+  id: bail
+  args:
+    gamma: 0.99
+    buffer_size: 64000
+    seed: 0
+    norm_reward: False
+    
+  kl_div:
+    coeff: 0.1
+    target_kl: 0.1
+
+  policy:
+    id: causal_lm_actor_critic_policy
+    args:
+      model_name: lvwerra/gpt2-imdb
+      apply_model_parallel: True
+      generation_kwargs:
+        do_sample: True
+        top_k: 50
+        min_length: 48
+        max_new_tokens: 48
+      
+train_evaluation:
+  bail_learn:
+    seed: 0
+    ue_lr: 0.00001
+    ue_wd: 0.02
+    ue_loss_k: 1000
+    ue_train_epoch: 5
+    ue_batch_size: 16
+    ue_consecutive_steps: 3
+    # ue_clip: None
+    pct: 0.2
+
+  n_epochs: 200
+  train_batch_size: 32
+  n_batch: 100
+  learning_rate: 0.00001
+  weight_decay: 0
+  beta: 0.05
+  
+  eval_batch_size: 32
+  eval_every: 2
+  save_every: 5
+  metrics:
+    - id: learned_reward
+      args: 
+        model_name: lvwerra/distilbert-imdb
+        label_ix: 1
+        batch_size: 100
+    - id: causal_perplexity
+      args:
+        tokenizer_id: gpt2
+        stride: 512
+        model_type: causal
+#    - id: diversity
+#      args: {}
